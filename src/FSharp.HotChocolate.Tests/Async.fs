@@ -128,21 +128,27 @@ type QueryWithCostedResolvers() =
 
 module private CancellableResolverCancellationProbe =
 
-    let mutable TaskStarted =
-        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    type Probe = {
+        ReceivedToken: TaskCompletionSource<CancellationToken>
+        Complete: TaskCompletionSource<unit>
+    }
 
-    let mutable ValueTaskStarted =
-        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-    let waitForCancellation (started: TaskCompletionSource<unit>) (ct: CancellationToken) =
+    let create () = {
+        ReceivedToken = TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously)
+        Complete = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    }
+
+
+    let mutable TaskProbe = create ()
+
+    let mutable ValueTaskProbe = create ()
+
+    let captureCancellationToken (probe: Probe) (ct: CancellationToken) =
         task {
-            let cancelled =
-                TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
-
-            use _ = ct.Register(fun () -> cancelled.TrySetCanceled(ct) |> ignore)
-
-            started.TrySetResult() |> ignore
-            return! cancelled.Task
+            probe.ReceivedToken.TrySetResult(ct) |> ignore
+            do! probe.Complete.Task
+            return true
         }
 
 
@@ -160,13 +166,15 @@ type QueryWithCancellableResolvers() =
 
     member _.CancellableTaskHasRequestCancellationToken() : CancellationToken -> Task<bool> =
         fun ct ->
-            CancellableResolverCancellationProbe.waitForCancellation CancellableResolverCancellationProbe.TaskStarted ct
+            CancellableResolverCancellationProbe.captureCancellationToken
+                CancellableResolverCancellationProbe.TaskProbe
+                ct
 
     member _.CancellableValueTaskHasRequestCancellationToken() : CancellationToken -> ValueTask<bool> =
         fun ct ->
             ValueTask<bool>(
-                CancellableResolverCancellationProbe.waitForCancellation
-                    CancellableResolverCancellationProbe.ValueTaskStarted
+                CancellableResolverCancellationProbe.captureCancellationToken
+                    CancellableResolverCancellationProbe.ValueTaskProbe
                     ct
             )
 
@@ -371,14 +379,19 @@ let ``Cancellable Task receives request cancellation token`` () =
         let! executor = createCancellableResolverBuilder().BuildRequestExecutorAsync()
         use cts = new CancellationTokenSource()
 
-        CancellableResolverCancellationProbe.TaskStarted <-
-            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let probe = CancellableResolverCancellationProbe.create ()
+        CancellableResolverCancellationProbe.TaskProbe <- probe
 
         let executeTask =
             executor.ExecuteAsync("query { cancellableTaskHasRequestCancellationToken }", cts.Token)
 
-        do! CancellableResolverCancellationProbe.TaskStarted.Task.WaitAsync(cancellationTestTimeout)
-        cts.Cancel()
+        try
+            let! receivedToken = probe.ReceivedToken.Task.WaitAsync(cancellationTestTimeout)
+            cts.Cancel()
+
+            Assert.True(receivedToken.IsCancellationRequested)
+        finally
+            probe.Complete.TrySetResult() |> ignore
 
         let! completed = Task.WhenAny(executeTask, Task.Delay(cancellationTestTimeout))
         Assert.Same(executeTask :> Task, completed)
@@ -396,14 +409,19 @@ let ``Cancellable ValueTask receives request cancellation token`` () =
         let! executor = createCancellableResolverBuilder().BuildRequestExecutorAsync()
         use cts = new CancellationTokenSource()
 
-        CancellableResolverCancellationProbe.ValueTaskStarted <-
-            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let probe = CancellableResolverCancellationProbe.create ()
+        CancellableResolverCancellationProbe.ValueTaskProbe <- probe
 
         let executeTask =
             executor.ExecuteAsync("query { cancellableValueTaskHasRequestCancellationToken }", cts.Token)
 
-        do! CancellableResolverCancellationProbe.ValueTaskStarted.Task.WaitAsync(cancellationTestTimeout)
-        cts.Cancel()
+        try
+            let! receivedToken = probe.ReceivedToken.Task.WaitAsync(cancellationTestTimeout)
+            cts.Cancel()
+
+            Assert.True(receivedToken.IsCancellationRequested)
+        finally
+            probe.Complete.TrySetResult() |> ignore
 
         let! completed = Task.WhenAny(executeTask, Task.Delay(cancellationTestTimeout))
         Assert.Same(executeTask :> Task, completed)
