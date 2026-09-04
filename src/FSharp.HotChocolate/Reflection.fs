@@ -349,6 +349,20 @@ let getSingleFieldUnionData (unionValue: obj) : obj =
     getCachedSingleFieldUnionReader (unionValue.GetType()) unionValue
 
 
+let tryGetFSharpUnionBaseType =
+    memoizeRefEq (fun (ty: Type) ->
+        let rec findUnionBaseType (baseType: Type) =
+            if isNull baseType then None
+            elif FSharpType.IsUnion baseType then Some baseType
+            else findUnionBaseType baseType.BaseType
+
+        if ty.IsValueType then
+            None
+        else
+            findUnionBaseType ty.BaseType
+    )
+
+
 let tryGetInnerAsyncType =
     memoizeRefEq (fun (ty: Type) ->
         if ty.IsGenericType && ty.GetGenericTypeDefinition() = typedefof<Async<_>> then

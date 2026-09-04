@@ -2,12 +2,40 @@ module TypeConverters
 
 open System
 open HotChocolate
+open HotChocolate.Execution
+open HotChocolate.Types
 open HotChocolate.Utilities
+open Microsoft.Extensions.DependencyInjection
 open VerifyXunit
 open Xunit
 
 
 configureVerify
+
+
+type OutputUnion =
+    | Text of string
+    | Number of int
+
+
+type Query() =
+
+    member _.OutputUnion = Text "direct"
+
+    member _.OptionOfOutputUnion = Some(Text "option")
+
+
+let private outputUnionBuilder =
+    ServiceCollection()
+        .AddGraphQLServer(disableDefaultSecurity = true)
+        .AddQueryType<Query>()
+        .AddFSharpSupport()
+        .AddTypeConverter<OutputUnion, string>(fun value ->
+            match value with
+            | Text value -> value
+            | Number value -> string value
+        )
+        .BindRuntimeType<OutputUnion, StringType>()
 
 
 let private rootConverter =
@@ -138,6 +166,18 @@ let private conversionCase name sourceType targetType value format =
 
 let private collectionConversionCase converterProvider name sourceType targetType value format =
     conversionCaseWith converterProvider collectionRootConverter name sourceType targetType value format
+
+
+[<Theory>]
+[<InlineData("query { outputUnion }", "\"outputUnion\": \"direct\"")>]
+[<InlineData("query { optionOfOutputUnion }", "\"optionOfOutputUnion\": \"option\"")>]
+let ``Registered output converter handles reference union case runtime types`` (query: string) (expected: string) =
+    task {
+        let! result = outputUnionBuilder.ExecuteRequestAsync(query)
+        let json = result.ToJson()
+
+        Assert.Contains(expected, json)
+    }
 
 
 [<Fact>]

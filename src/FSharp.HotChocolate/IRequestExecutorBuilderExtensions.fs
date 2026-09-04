@@ -36,6 +36,7 @@ type IRequestExecutorBuilder with
 
         this
             .ConfigureSchemaServices(_.TryAddSingleton<FSharpUnionAsEnumExplicitTypeRegistry>())
+            .AddTypeConverter<FSharpUnionCaseTypeConverter>()
             .AddTypeConverter<OptionTypeConverter>()
             .AddTypeConverter<ListTypeConverter>()
             .AddTypeConverter<SetTypeConverter>()

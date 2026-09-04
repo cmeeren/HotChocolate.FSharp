@@ -1,6 +1,11 @@
 Release notes
 ==============
 
+### 1.0.3 (2026-09-04)
+
+- Fixed GraphQL scalar fields backed by F# discriminated unions failing to serialize at runtime when a type converter
+  is registered for the union. Option-wrapped fields are fixed as well.
+
 ### 1.0.2 (2026-05-21)
 
 - Fixed paged `Async<_>` object fields returning enumerable struct values such as `ImmutableArray<_>`, which could
