@@ -9,10 +9,10 @@ type Query {
   nodes("The list of node IDs." ids: [ID!]!): [Node]!
   asyncOfOptionOfInt(returnNull: Boolean!): Int
   asyncOfOptionOfString(returnNull: Boolean!): String
+  asyncHasRequestCancellationToken: Boolean!
   asyncBoxedFieldWithDescriptor: MyUnion!
   asyncOfInt: Int!
   asyncOfString: String!
-  asyncHasRequestCancellationToken: Boolean!
 }
 
 type A {

@@ -12,6 +12,7 @@ open System.Threading.Tasks
 open Microsoft.Extensions.DependencyInjection
 open HotChocolate
 open HotChocolate.Execution
+open HotChocolate.Resolvers
 open HotChocolate.Types
 open HotChocolate.Types.Pagination
 open HotChocolate.Types.Relay
@@ -74,10 +75,48 @@ type MyUnionDescriptor() =
         descriptor.Type<ObjectType<B>>() |> ignore
 
 
-module private AsyncCancellationProbe =
+type private CancellationProbe(waitForCancellation: bool) =
 
-    let mutable Started =
-        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    member val Tokens =
+        TaskCompletionSource<CancellationToken * CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    member val Exited = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+
+    member this.RunAsync(requestToken: CancellationToken) =
+        async {
+            try
+                let! ct = Async.CancellationToken
+                this.Tokens.TrySetResult(requestToken, ct) |> ignore
+
+                if waitForCancellation then
+                    do! Async.Sleep Timeout.Infinite
+
+                return true
+            finally
+                this.Exited.TrySetResult() |> ignore
+        }
+
+
+    member this.RunTask(requestToken: CancellationToken, ct: CancellationToken) =
+        task {
+            try
+                this.Tokens.TrySetResult(requestToken, ct) |> ignore
+
+                if waitForCancellation then
+                    do! Task.Delay(Timeout.Infinite, ct)
+
+                return true
+            finally
+                this.Exited.TrySetResult() |> ignore
+        }
+
+
+module private CancellationProbes =
+
+    let mutable AsyncProbe = CancellationProbe(false)
+    let mutable TaskProbe = CancellationProbe(false)
+    let mutable ValueTaskProbe = CancellationProbe(false)
 
 
 type Query() =
@@ -92,17 +131,8 @@ type Query() =
     member _.AsyncOfOptionOfString(returnNull: bool) =
         async.Return(if returnNull then None else Some "1")
 
-    member _.AsyncHasRequestCancellationToken =
-        async {
-            let! ct = Async.CancellationToken
-
-            return!
-                Async.FromContinuations(fun (cont, _, _) ->
-                    ct.Register(fun () -> cont true) |> ignore
-
-                    AsyncCancellationProbe.Started.TrySetResult() |> ignore
-                )
-        }
+    member _.AsyncHasRequestCancellationToken(context: IResolverContext) =
+        CancellationProbes.AsyncProbe.RunAsync(context.RequestAborted)
 
     [<GraphQLType(typeof<MyUnionDescriptor>)>]
     member _.AsyncBoxedFieldWithDescriptor() = async.Return(box { A.X = 1 })
@@ -126,31 +156,6 @@ type QueryWithCostedResolvers() =
     member _.AsyncString = async.Return "1"
 
 
-module private CancellableResolverCancellationProbe =
-
-    type Probe(cancelRequest: unit -> unit) =
-
-        let mutable cancellationInitiallyObserved = false
-        let mutable cancellationObserved = false
-
-
-        member _.CancellationInitiallyObserved = cancellationInitiallyObserved
-
-
-        member _.CancellationObserved = cancellationObserved
-
-
-        member _.ObserveRequestCancellation(ct: CancellationToken) =
-            cancellationInitiallyObserved <- ct.IsCancellationRequested
-            cancelRequest ()
-            cancellationObserved <- ct.IsCancellationRequested
-
-
-    let mutable TaskProbe = Probe(fun () -> ())
-
-    let mutable ValueTaskProbe = Probe(fun () -> ())
-
-
 type QueryWithCancellableResolvers() =
 
     member _.CancellableTaskOfInt() : CancellationToken -> Task<int> = fun _ -> Task.FromResult 1
@@ -163,15 +168,13 @@ type QueryWithCancellableResolvers() =
     member _.CancellableValueTaskOfOptionOfInt(returnNull: bool) : CancellationToken -> ValueTask<int option> =
         fun _ -> ValueTask.FromResult(if returnNull then None else Some 1)
 
-    member _.CancellableTaskHasRequestCancellationToken() : CancellationToken -> Task<bool> =
-        fun ct ->
-            CancellableResolverCancellationProbe.TaskProbe.ObserveRequestCancellation(ct)
-            Task.FromException<bool>(GraphQLException("CancellationRaised"))
+    member _.CancellableTaskHasRequestCancellationToken(context: IResolverContext) : CancellationToken -> Task<bool> =
+        fun ct -> CancellationProbes.TaskProbe.RunTask(context.RequestAborted, ct)
 
-    member _.CancellableValueTaskHasRequestCancellationToken() : CancellationToken -> ValueTask<bool> =
-        fun ct ->
-            CancellableResolverCancellationProbe.ValueTaskProbe.ObserveRequestCancellation(ct)
-            ValueTask.FromException<bool>(GraphQLException("CancellationRaised"))
+    member _.CancellableValueTaskHasRequestCancellationToken
+        (context: IResolverContext)
+        : CancellationToken -> ValueTask<bool> =
+        fun ct -> ValueTask<bool>(CancellationProbes.ValueTaskProbe.RunTask(context.RequestAborted, ct))
 
 
 type QueryWithAsyncPaging() =
@@ -296,22 +299,58 @@ let ``Can get asyncOfOptionOfString - null`` () =
     verifyQuery "query { asyncOfOptionOfString(returnNull: true) }"
 
 
-[<Fact>]
-let ``Async receives request cancellation token`` () =
+let private createCancellationTestExecutor fieldName probe =
+    match fieldName with
+    | "asyncHasRequestCancellationToken" ->
+        CancellationProbes.AsyncProbe <- probe
+        builder.BuildRequestExecutorAsync()
+    | "cancellableTaskHasRequestCancellationToken" ->
+        CancellationProbes.TaskProbe <- probe
+        createCancellableResolverBuilder().BuildRequestExecutorAsync()
+    | "cancellableValueTaskHasRequestCancellationToken" ->
+        CancellationProbes.ValueTaskProbe <- probe
+        createCancellableResolverBuilder().BuildRequestExecutorAsync()
+    | _ -> failwithf "Unknown cancellation test field: %s" fieldName
+
+
+[<Theory>]
+[<InlineData("asyncHasRequestCancellationToken")>]
+[<InlineData("cancellableTaskHasRequestCancellationToken")>]
+[<InlineData("cancellableValueTaskHasRequestCancellationToken")>]
+let ``Resolver receives request cancellation token`` fieldName =
     task {
         use cts = new CancellationTokenSource()
-        AsyncCancellationProbe.Started <- TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let probe = CancellationProbe(false)
+        let! executor = createCancellationTestExecutor fieldName probe
 
-        let executeTask =
-            builder.ExecuteRequestAsync("query { asyncHasRequestCancellationToken }", cancellationToken = cts.Token)
+        let! result = executor.ExecuteAsync("query { " + fieldName + " }", cts.Token).WaitAsync(cancellationTestTimeout)
 
-        do! AsyncCancellationProbe.Started.Task.WaitAsync(cancellationTestTimeout)
+        let! requestToken, resolverToken = probe.Tokens.Task.WaitAsync(cancellationTestTimeout)
+        Assert.True(requestToken.CanBeCanceled)
+        Assert.Equal(requestToken, resolverToken)
+        Assert.DoesNotContain("\"errors\"", result.ToJson())
+    }
+
+
+[<Theory>]
+[<InlineData("asyncHasRequestCancellationToken")>]
+[<InlineData("cancellableTaskHasRequestCancellationToken")>]
+[<InlineData("cancellableValueTaskHasRequestCancellationToken")>]
+let ``Request cancellation stops resolver and completes execution`` fieldName =
+    task {
+        use cts = new CancellationTokenSource()
+        let probe = CancellationProbe(true)
+        let! executor = createCancellationTestExecutor fieldName probe
+
+        let executeTask = executor.ExecuteAsync("query { " + fieldName + " }", cts.Token)
+
+        let! _ = probe.Tokens.Task.WaitAsync(cancellationTestTimeout)
         cts.Cancel()
 
-        let! completed = Task.WhenAny(executeTask, Task.Delay(cancellationTestTimeout))
-        Assert.Same(executeTask :> Task, completed)
+        // Distinguish a resolver that ignores cancellation from execution that hangs after it exits.
+        do! probe.Exited.Task.WaitAsync(cancellationTestTimeout)
 
-        let! result = executeTask
+        let! result = executeTask.WaitAsync(cancellationTestTimeout)
         let json = result.ToJson()
 
         Assert.Contains("\"HC0049\"", json)
@@ -365,50 +404,6 @@ query {
         Assert.Contains("\"cancellableTaskOfOptionOfStringNull\": null", json)
         Assert.Contains("\"cancellableValueTaskOfOptionOfInt\": 1", json)
         Assert.Contains("\"cancellableValueTaskOfOptionOfIntNull\": null", json)
-    }
-
-
-[<Fact>]
-let ``Cancellable Task receives request cancellation token`` () =
-    task {
-        let! executor = createCancellableResolverBuilder().BuildRequestExecutorAsync()
-        use cts = new CancellationTokenSource()
-
-        let probe = CancellableResolverCancellationProbe.Probe(cts.Cancel)
-        CancellableResolverCancellationProbe.TaskProbe <- probe
-
-        let! result =
-            executor
-                .ExecuteAsync("query { cancellableTaskHasRequestCancellationToken }", cts.Token)
-                .WaitAsync(cancellationTestTimeout)
-
-        Assert.False(probe.CancellationInitiallyObserved)
-        Assert.True(probe.CancellationObserved)
-        let json = result.ToJson()
-
-        Assert.Contains("\"HC0049\"", json)
-    }
-
-
-[<Fact>]
-let ``Cancellable ValueTask receives request cancellation token`` () =
-    task {
-        let! executor = createCancellableResolverBuilder().BuildRequestExecutorAsync()
-        use cts = new CancellationTokenSource()
-
-        let probe = CancellableResolverCancellationProbe.Probe(cts.Cancel)
-        CancellableResolverCancellationProbe.ValueTaskProbe <- probe
-
-        let! result =
-            executor
-                .ExecuteAsync("query { cancellableValueTaskHasRequestCancellationToken }", cts.Token)
-                .WaitAsync(cancellationTestTimeout)
-
-        Assert.False(probe.CancellationInitiallyObserved)
-        Assert.True(probe.CancellationObserved)
-        let json = result.ToJson()
-
-        Assert.Contains("\"HC0049\"", json)
     }
 
 
