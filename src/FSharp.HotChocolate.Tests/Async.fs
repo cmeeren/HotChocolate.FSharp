@@ -338,22 +338,26 @@ let ``Resolver receives request cancellation token`` fieldName =
 [<InlineData("cancellableValueTaskHasRequestCancellationToken")>]
 let ``Request cancellation stops resolver and completes execution`` fieldName =
     task {
-        use cts = new CancellationTokenSource()
-        let probe = CancellationProbe(true)
-        let! executor = createCancellationTestExecutor fieldName probe
+        try
+            use cts = new CancellationTokenSource()
+            let probe = CancellationProbe(true)
+            let! executor = createCancellationTestExecutor fieldName probe
 
-        let executeTask = executor.ExecuteAsync("query { " + fieldName + " }", cts.Token)
+            let executeTask = executor.ExecuteAsync("query { " + fieldName + " }", cts.Token)
 
-        let! _ = probe.Tokens.Task.WaitAsync(cancellationTestTimeout)
-        cts.Cancel()
+            let! _ = probe.Tokens.Task.WaitAsync(cancellationTestTimeout)
+            cts.Cancel()
 
-        // Distinguish a resolver that ignores cancellation from execution that hangs after it exits.
-        do! probe.Exited.Task.WaitAsync(cancellationTestTimeout)
+            // Distinguish a resolver that ignores cancellation from execution that hangs after it exits.
+            do! probe.Exited.Task.WaitAsync(cancellationTestTimeout)
 
-        let! result = executeTask.WaitAsync(cancellationTestTimeout)
-        let json = result.ToJson()
+            let! result = executeTask.WaitAsync(cancellationTestTimeout)
+            let json = result.ToJson()
 
-        Assert.Contains("\"HC0049\"", json)
+            Assert.Contains("\"HC0049\"", json)
+        with :? TimeoutException as ex when Environment.GetEnvironmentVariable("FSHARP_HOTCHOCOLATE_CAPTURE_HANG") = "1" ->
+            // CI's crash collector captures the pending execution before the testhost exits.
+            Environment.FailFast("Cancellation test hung: " + fieldName, ex)
     }
 
 

@@ -26,4 +26,14 @@ jobs:
         run: .github/workflows/update-hc.ps1
 
       - name: Test
-        run: dotnet test -c Release -maxCpuCount
+        env:
+          FSHARP_HOTCHOCOLATE_CAPTURE_HANG: '1'
+        run: dotnet test -c Release -maxCpuCount --blame-crash --blame-crash-dump-type full --logger trx --results-directory TestResults
+
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: test-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: TestResults/
+          retention-days: 7
